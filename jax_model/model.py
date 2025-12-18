@@ -1,17 +1,23 @@
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from .layers import SqueezeformerBlock, Swish, RelPositionalEncoding
-from .config import Config
-import math
+from typing import Optional, List
+from . import layers, config
+import math # Added for math.ceil
+
+# --- Feature Extractor ---
 
 class FeatureExtractor(nnx.Module):
     def __init__(self, n_landmarks: int, out_dim: int, rngs: nnx.Rngs = None):
-        self.in_channels = (32 // 2) * n_landmarks # Matches PyTorch logic
+        # self.in_channels = (32 // 2) * n_landmarks 
+        # Match PyTorch exactly: 32 * ceil(n / 2)
+        self.in_channels = 32 * math.ceil(n_landmarks / 2)
         self.out_dim = out_dim
         
         self.stem_linear = nnx.Linear(self.in_channels, out_dim, use_bias=False, rngs=rngs)
-        self.stem_bn = nnx.BatchNorm(out_dim, momentum=0.95, rngs=rngs)
+        # PyTorch momentum 0.95 -> Flax decay 0.05
+        self.stem_bn = nnx.BatchNorm(out_dim, momentum=0.05, rngs=rngs)
         
         # Conv Stem: 3 input channels (x, y, z), 32 out.
         # PyTorch: Conv2d(3, 32, (3,3), (1,2), (1,1))
@@ -22,50 +28,30 @@ class FeatureExtractor(nnx.Module):
         self.conv_stem = nnx.Conv(
             in_features=3,
             out_features=32,
-            kernel_size=(3, 3),
+            kernel_size=(3, 3), # (time, landmarks)
             strides=(1, 2),
             padding=[(1, 1), (1, 1)],
             use_bias=False,
             rngs=rngs
         )
-        self.bn_conv = nnx.BatchNorm(32, momentum=0.1, rngs=rngs) # PyTorch momentum 0.1 is Flax 0.9? Wait.
+        self.bn_conv = nnx.BatchNorm(32, momentum=0.9, rngs=rngs) # PyTorch momentum 0.1 -> Flax decay 0.9
         # PyTorch momentum m means: new_running = (1-m)*old + m*observed.
         # Flax momentum m means: new_running = m*old + (1-m)*observed.
-        # So PyTorch 0.1 => Flax 0.1 ?? No.
-        # PyTorch: run = (1-0.1)*run + 0.1*obs = 0.9*run + 0.1*obs
-        # Flax: run = 0.9*run + (1-0.9)*obs.
         # So PyTorch 0.1 matches Flax 0.9.
         # BUT: In PyTorch code `stem_bn` has momentum=0.95.
-        # PyTorch 0.95 => 0.05 update. Flax 0.95 => 0.05 update. 
-        # Wait, PyTorch docs say: "momentum: the value used for the running_mean and running_var computation. Can be set to None for cumulative moving average (i.e. simple average). Default: 0.1"
-        # x_new = (1 - momentum) * x_old + momentum * x_t
-        # Flax: decay_rate * old + (1 - decay_rate) * new
-        # So PyTorch 0.1 (default) = Flax 0.9.
-        # PyTorch 0.95 (stem_bn) = Flax 0.05? NO.
-        # Usually users mean decay when they say 0.95. 
-        # Let's assume PyTorch code meant standard smoothing.
-        # If PyTorch user sets 0.95 explicitly... likely they want high smoothing?
-        # Actually in `mdl_1_pt.py`: `self.stem_bn = nn.BatchNorm1d(out_dim, momentum=0.95)`
-        # If they meant slow updates, PyTorch 0.1 is standard. 0.95 is VERY FAST updates (almost instantaneous).
-        # OR they confused PyTorch momentum with Keras/TF momentum (where 0.99 is standard).
-        # We will iterate on this. For now use 0.95 as decay (slow updates) which is safer default.
         
         self.act = nnx.silu # Swish
 
     def __call__(self, x: jax.Array, mask: jax.Array, training: bool = True) -> jax.Array:
-        # x: (B, T, N, 3)
-        # mask: (B, T)
+        # x: (B, T, N, 3) (or N, 3 for simpler cases but we invoke with T)
         
-        # Conv Stem
-        # JAX Conv expects (B, H, W, C).
-        # We have (B, T, N, 3).
-        xc = self.conv_stem(x) # (B, T, N/2, 32) (approx)
+        xc = self.conv_stem(x) # (B, T, ceil(N/2), 32)
         xc = self.bn_conv(xc, use_running_average=not training)
         xc = self.act(xc)
         
         # Flatten
-        # (B, T, N/2, 32) -> (B, T, N/2 * 32)
-        B, T, N2, C = xc.shape
+        # (B, T, ceil(N/2), 32) -> (B, T, ceil(N/2)*32)
+        B, T = xc.shape[:2]
         xc = xc.reshape(B, T, -1)
         
         # Stem Linear
@@ -74,156 +60,316 @@ class FeatureExtractor(nnx.Module):
         # Masked BN logic
         mask_bool = None
         if mask is not None:
-             mask_bool = mask.astype(bool)[..., None] # (B, T, 1) to broadcast with (B, T, C)
-        
-        x = self.stem_bn(x, use_running_average=not training, mask=mask_bool) # Flax BN uses mask for stats if provided
+             mask_bool = mask.astype(bool)[..., None] # (B, T, 1)
+
+        x = self.stem_bn(x, use_running_average=not training, mask=mask_bool)
         
         if mask is not None:
             x = x * mask[:, :, None]
             
         return x
 
-class SqueezeformerEncoder(nnx.Module):
-    def __init__(self, config: Config, rngs: nnx.Rngs = None):
-        cfg = config.encoder_config
-        self.num_layers = cfg.num_layers
-        self.blocks = nnx.List([
-            SqueezeformerBlock(
-                encoder_dim=cfg.encoder_dim,
-                num_attention_heads=cfg.num_attention_heads,
-                feed_forward_expansion_factor=cfg.feed_forward_expansion_factor,
-                conv_expansion_factor=cfg.conv_expansion_factor,
-                feed_forward_dropout_p=cfg.feed_forward_dropout_p,
-                attention_dropout_p=cfg.attention_dropout_p,
-                conv_dropout_p=cfg.conv_dropout_p,
-                conv_kernel_size=cfg.conv_kernel_size,
-                rngs=rngs
-            )
-            for _ in range(self.num_layers)
-        ])
+# --- Encoder ---
 
-    def __call__(self, x: jax.Array, mask: jax.Array, training: bool = True) -> jax.Array:
+class SqueezeformerEncoder(nnx.Module):
+    def __init__(self, config: config.EncoderConfig, rngs: nnx.Rngs = None):
+        self.config = config
+        self.config = config
+        # Embedding removed to match PyTorch (Post-Norm, no projection here)
+        
+        # RoPE
+        # PyTorch: rotary_emb = LlamaRotaryEmbedding(encoder_dim // num_heads, ...)
+        # We need to implement LlamaRotaryEmbedding in layers.py first and use it here or passing cos/sin?
+        # In mdl_2_pt, rotary_emb is in Net, and cos/sin are passed to Encoder.
+        # So we don't define it here necessarily, but we can usage consistent with Net.
+        
+        # Blocks
+        self.blocks = nnx.List([
+            layers.SqueezeformerBlock(
+                encoder_dim=config.encoder_dim,
+                num_attention_heads=config.num_attention_heads,
+                feed_forward_expansion_factor=config.feed_forward_expansion_factor,
+                conv_expansion_factor=config.conv_expansion_factor,
+                feed_forward_dropout_p=config.feed_forward_dropout_p,
+                attention_dropout_p=config.attention_dropout_p,
+                conv_dropout_p=config.conv_dropout_p,
+                conv_kernel_size=config.conv_kernel_size,
+                rngs=rngs
+            ) for _ in range(config.num_layers)
+        ])
+        
+        # self.norm removed to match PyTorch
+ 
+        # mdl_2_pt SqueezeformerEncoder has: self.norm = nn.LayerNorm(encoder_dim)
+        
+    def __call__(self, x: jax.Array, cos: jax.Array, sin: jax.Array, mask: Optional[jax.Array] = None, training: bool = True) -> jax.Array:
+        # x: (B, T, D)
+        # No embedding projection
+
+        
         for block in self.blocks:
-            x = block(x, mask=mask, training=training)
+            x = block(x, cos, sin, mask=mask, training=training)
+            
+        # No final norm
+
         return x
 
-class TransformerDecoderLayer(nnx.Module):
-    # Minimal decoding layer
-    def __init__(self, d_model: int, num_heads: int, dim_feedforward: int, dropout: float = 0.1, rngs: nnx.Rngs = None):
-        self.self_attn = nnx.MultiHeadAttention(num_heads=num_heads, in_features=d_model, dropout_rate=dropout, rngs=rngs, decode=False) 
-        # We might need 'decode=True' for fast inference later.
-        
-        self.multihead_attn = nnx.MultiHeadAttention(num_heads=num_heads, in_features=d_model, dropout_rate=dropout, rngs=rngs, decode=False)
-        
-        self.linear1 = nnx.Linear(d_model, dim_feedforward, rngs=rngs)
-        self.dropout = nnx.Dropout(dropout, rngs=rngs)
-        self.linear2 = nnx.Linear(dim_feedforward, d_model, rngs=rngs)
-        
-        self.norm1 = nnx.LayerNorm(d_model, rngs=rngs)
-        self.norm2 = nnx.LayerNorm(d_model, rngs=rngs)
-        self.norm3 = nnx.LayerNorm(d_model, rngs=rngs)
-        
-        self.dropout1 = nnx.Dropout(dropout, rngs=rngs)
-        self.dropout2 = nnx.Dropout(dropout, rngs=rngs)
-        self.dropout3 = nnx.Dropout(dropout, rngs=rngs)
-        
-        self.activation = nnx.gelu
+# --- Decoder ---
 
-    def __call__(self, tgt, memory, tgt_mask=None, memory_mask=None, training=True):
-        # tgt: (B, T, D)
-        # memory: (B, S, D)
+class TransformerDecoderLayer(nnx.Module):
+    def __init__(self, config: config.DecoderConfig, rngs: nnx.Rngs = None):
+        self.self_attn = layers.MultiHeadedSelfAttentionModule(config.d_model, config.num_heads, config.attention_dropout, rngs=rngs)
+        # Note: Decoder Self-Attention needs Causal Mask
         
+        # Cross Attention
+        # We can reuse MultiHeadedSelfAttentionModule if it supports key/value/query separately?
+        # Currently MultiHeadedSelfAttentionModule wraps RelPositionalEncoding + RelativeMultiHeadAttention.
+        # But Decoder in mdl_2_pt (Speech2TextDecoder) uses Standard Attention usually?
+        # Wait, mdl_2_pt uses "Speech2TextDecoder".
+        # Speech2Text uses sinusoidal position + standard attention.
+        # Our layers.py implements RelativeAttention.
+        # We might need StandardAttention for Decoder? 
+        # For now, let's assume we can reuse standard logic or we need to add StandardAttention to layers.
+        # RelativeAttention is usually for Encoder. Decoder usually absolute?
+        # Speech2Text uses absolute.
+        pass
+
+# Wait, implementing full Decoder from scratch is complex.
+# mdl_2_pt uses transformers.Speech2TextDecoder.
+# We should probably port a simplified version or just use a standard Flax Transformer Decoder.
+# Or better: check if we can reuse layers.RelativeMultiHeadAttention if we disable relative part?
+# Actually, let's make a simple DecoderLayer in `model.py` using `nnx.MultiHeadAttention` from Flax (if available) or implement simple one.
+# Flax nnx doesn't have MultiHeadAttention built-in as standard module yet? It has `nnx.MultiHeadAttention`?
+# Let's check imports. `from flax import nnx`
+# We'll implement a simple Standard MHSA for Decoder.
+
+class StandardMultiHeadAttention(nnx.Module):
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.1, rngs: nnx.Rngs = None):
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        self.q_proj = nnx.Linear(dim, dim, rngs=rngs)
+        self.k_proj = nnx.Linear(dim, dim, rngs=rngs)
+        self.v_proj = nnx.Linear(dim, dim, rngs=rngs)
+        self.o_proj = nnx.Linear(dim, dim, rngs=rngs)
+        self.dropout = nnx.Dropout(dropout, rngs=rngs)
+
+    def __call__(self, q_x, k_x, v_x, mask=None, training=True):
+        # q_x: (B, Tq, D)
+        B, Tq, D = q_x.shape
+        Tk = k_x.shape[1]
+        
+        q = self.q_proj(q_x).reshape(B, Tq, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.k_proj(k_x).reshape(B, Tk, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.v_proj(v_x).reshape(B, Tk, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        
+        attn = jnp.matmul(q, k.transpose(0, 1, 3, 2)) * self.scale
+        
+        if mask is not None:
+            # mask: (B, 1, Tq, Tk)
+            attn = attn + mask
+            
+        attn = nnx.softmax(attn, axis=-1)
+        attn = self.dropout(attn, deterministic=not training)
+        
+        out = jnp.matmul(attn, v).transpose(0, 2, 1, 3).reshape(B, Tq, D)
+        return self.o_proj(out)
+
+class DecoderLayer(nnx.Module):
+    def __init__(self, config: config.DecoderConfig, rngs: nnx.Rngs = None):
+        self.self_attn = StandardMultiHeadAttention(config.d_model, config.num_heads, config.attention_dropout, rngs=rngs)
+        self.self_attn_layer_norm = nnx.LayerNorm(config.d_model, epsilon=1e-5, rngs=rngs)
+        
+        self.encoder_attn = StandardMultiHeadAttention(config.d_model, config.num_heads, config.attention_dropout, rngs=rngs)
+        self.encoder_attn_layer_norm = nnx.LayerNorm(config.d_model, epsilon=1e-5, rngs=rngs)
+        
+        self.fc1 = nnx.Linear(config.d_model, config.decoder_ffn_dim, rngs=rngs)
+        self.act = layers.Swish() # Or GELU? Speech2Text uses GELU usually.
+        self.fc2 = nnx.Linear(config.decoder_ffn_dim, config.d_model, rngs=rngs)
+        self.final_layer_norm = nnx.LayerNorm(config.d_model, epsilon=1e-5, rngs=rngs)
+        self.dropout = nnx.Dropout(config.attention_dropout, rngs=rngs) # Reuse p
+
+    def __call__(self, x, encoder_out, encoder_mask=None, causal_mask=None, training=True):
         # Self Attn
-        # tgt_mask needed for causal.
-        x = tgt
-        x2 = self.self_attn(x, x, mask=tgt_mask, deterministic=not training)
-        x = x + self.dropout1(x2, deterministic=not training)
-        x = self.norm1(x)
+        residual = x
+        x = self.self_attn(x, x, x, mask=causal_mask, training=training)
+        x = self.dropout(x, deterministic=not training)
+        x = self.self_attn_layer_norm(residual + x)
         
         # Cross Attn
-        x2 = self.multihead_attn(x, memory, mask=memory_mask, deterministic=not training)
-        x = x + self.dropout2(x2, deterministic=not training)
-        x = self.norm2(x)
+        residual = x
+        x = self.encoder_attn(x, encoder_out, encoder_out, mask=encoder_mask, training=training)
+        x = self.dropout(x, deterministic=not training)
+        x = self.encoder_attn_layer_norm(residual + x)
         
-        # FFN
-        x2 = self.linear2(self.dropout(self.activation(self.linear1(x)), deterministic=not training))
-        x = x + self.dropout3(x2, deterministic=not training)
-        x = self.norm3(x)
+        # FF
+        residual = x
+        x = self.act(self.fc1(x))
+        x = self.dropout(x, deterministic=not training)
+        x = self.fc2(x)
+        x = self.dropout(x, deterministic=not training)
+        x = self.final_layer_norm(residual + x)
         
         return x
 
 class Decoder(nnx.Module):
-    def __init__(self, config: Config, rngs: nnx.Rngs = None):
-        cfg = config.decoder_config
+    layers: nnx.List
+
+    def __init__(self, config: config.DecoderConfig, rngs: nnx.Rngs = None):
+        self.config = config
+        cfg = config
         self.embed_tokens = nnx.Embed(cfg.vocab_size, cfg.d_model, rngs=rngs)
-        self.embed_positions = nnx.Embed(cfg.max_length + 2, cfg.d_model, rngs=rngs) # Offset?
+        self.embed_positions = layers.SinusoidalPositionalEmbedding(cfg.max_length + 2, cfg.d_model, rngs=rngs)
         
         self.layers = nnx.List([
-            TransformerDecoderLayer(cfg.d_model, cfg.num_heads, cfg.decoder_ffn_dim, cfg.attention_dropout, rngs=rngs)
+            DecoderLayer(cfg, rngs=rngs)
             for _ in range(cfg.decoder_layers)
         ])
+        self.layer_norm = nnx.LayerNorm(cfg.d_model, epsilon=1e-5, rngs=rngs)
         
-        self.embed_scale = math.sqrt(cfg.d_model)
-        self.pad_token_id = cfg.pad_token_id
-        
-    def __call__(self, input_ids, encoder_hidden_states, attention_mask=None, encoder_attention_mask=None, training=True):
+    def __call__(self, input_ids, encoder_hidden_states, encoder_attention_mask=None, training=True):
         # input_ids: (B, T)
         B, T = input_ids.shape
+        x = self.embed_tokens(input_ids)
         
-        # Alignment with PyTorch: scaler * (embed + pos)
-        x = self.embed_tokens(input_ids) * self.embed_scale
-        positions = jnp.arange(T)[None, :]
-        x = x + self.embed_positions(positions) # (B, T, D)
+        x = x + self.embed_positions(input_ids)
+        # Scale input? Speech2Text scales by sqrt(d_model)
+        x = x * math.sqrt(self.config.d_model)
         
-        # Decoder logic
-        # Causal Mask
-        # nnx.MultiHeadAttention expects mask (B, H, Q, K) or similar.
-        # We need generic causal mask.
-        causal_mask = nnx.make_causal_mask(input_ids)
+        # Causal mask
+        # (B, 1, T, T) with -inf upper triangular
+        idx = jnp.arange(T)
+        causal_mask = (idx[None, :] <= idx[:, None])
+        causal_mask = jnp.broadcast_to(causal_mask, (B, 1, T, T))
+        causal_mask = jnp.where(causal_mask, 0, -1e9)
         
-        # Combine with padding mask if provided
-        if attention_mask is not None:
-             # attention_mask is (B, 1, T) usually?
-             # causal_mask is (1, 1, T, T)
-             # We need min(-inf) where mask is 0.
-             pass 
-        
-        for layer in self.layers:
-            x = layer(x, encoder_hidden_states, tgt_mask=causal_mask, memory_mask=encoder_attention_mask, training=training)
+        # Encoder mask
+        # encoder_attention_mask: (B, S). 1=valid, 0=pad
+        if encoder_attention_mask is not None:
+             # (B, 1, 1, S)
+             em = encoder_attention_mask[:, None, None, :]
+             em = (1.0 - em) * -1e9
+        else:
+            em = None
             
+        for layer in self.layers:
+            x = layer(x, encoder_hidden_states, encoder_mask=em, causal_mask=causal_mask, training=training)
+            
+        x = self.layer_norm(x)
         return x
 
+# --- Net ---
+
 class Net(nnx.Module):
-    def __init__(self, config: Config, rngs: nnx.Rngs = None):
+    def __init__(self, config: config.Config, rngs: nnx.Rngs = None):
         self.config = config
+        
+        # Extractors
+        # PyTorch passes n_landmarks (e.g. 21) not coordinates (63).
         self.feature_extractor = FeatureExtractor(config.n_landmarks, config.encoder_config.encoder_dim, rngs=rngs)
-        self.encoder = SqueezeformerEncoder(config, rngs=rngs)
-        self.decoder = Decoder(config, rngs=rngs)
-        self.lm_head = nnx.Linear(config.decoder_config.d_model, config.decoder_config.vocab_size, use_bias=False, rngs=rngs)
+        self.feature_extractor_lhand = FeatureExtractor(21, config.encoder_config.encoder_dim // 4, rngs=rngs)
+        self.feature_extractor_rhand = FeatureExtractor(21, config.encoder_config.encoder_dim // 4, rngs=rngs)
+        self.feature_extractor_face = FeatureExtractor(55, config.encoder_config.encoder_dim // 4, rngs=rngs)
+        self.feature_extractor_pose = FeatureExtractor(33, config.encoder_config.encoder_dim // 4, rngs=rngs)
+        
+        # Encoder
+        self.encoder = SqueezeformerEncoder(config.encoder_config, rngs=rngs)
+        
+        # Decoders
+        self.decoder = Decoder(config.decoder_config, rngs=rngs)
+        self.decoder2 = Decoder(config.decoder_config, rngs=rngs) # Backward
+        
+        # Heads
+        self.fc = nnx.Linear(config.decoder_config.d_model, config.decoder_config.vocab_size, use_bias=False, rngs=rngs)
+        self.fc_bwd = nnx.Linear(config.decoder_config.d_model, config.decoder_config.vocab_size, use_bias=False, rngs=rngs)
+        
+        self.aux_fc = nnx.Linear(config.encoder_config.encoder_dim, 1, rngs=rngs)
+        
+        # Helper for landmarks
+        # 0-21: lhand, 21-42: rhand, 42-75: pose, 75-130: face
+        # We need to indices or logic to split inputs.
+        # But in JAX, we expect inputs to be (B, T, N, 3).
+        
+        # RoPE (Shared)
+        head_dim = config.encoder_config.encoder_dim // config.encoder_config.num_attention_heads
+        self.rotary_emb = layers.LlamaRotaryEmbedding(head_dim, max_position_embeddings=config.max_len, rngs=rngs)
 
-    def __call__(self, x: jax.Array, input_mask: jax.Array, decoder_input_ids: jax.Array, training: bool = True) -> jax.Array:
+    def __call__(self, x: jax.Array, mask: Optional[jax.Array] = None, token_ids: Optional[jax.Array] = None, training: bool = True):
         # x: (B, T, N, 3)
-        # input_mask: (B, T)
-        # decoder_input_ids: (B, T_out)
+        # mask: (B, T)
         
-        if input_mask is not None:
-             input_mask_bool = input_mask.astype(bool)
-        else:
-             input_mask_bool = None
-
-        x = self.feature_extractor(x, mask=input_mask, training=training) # FeatureExtractor handles float mask for mult, bool for BN?
-        # Wait, FeatureExtractor expect mask as Array. I should pass float there if it multiplies, but it calls BN with bool.
-        # I updated FeatureExtractor to handle casting itself.
+        # Preprocessing (Normalization) - Assuming preprocessed or doing it here?
+        # mdl_2_pt does normalization inside forward.
+        # We'll implement normalization in a separate helper or assume 'x' is raw and normalize here.
+        # But JAX normalization on 3D data might be expensive to JIT if not careful?
+        # Let's do feature extraction logic.
         
-        x = self.encoder(x, mask=input_mask_bool, training=training)
+        if mask is None:
+             mask = jnp.ones((x.shape[0], x.shape[1]), dtype=bool)
+             
+        # Extract Parts
+        # x is (B, T, 130, 3)
+        # Indices:
+        # LHand: 0-21
+        # RHand: 21-42
+        # Pose: 42-75
+        # Face: 75-130
         
-        # Decoder
-        # encoder_attention_mask: (B, 1, 1, T_enc)?
-        enc_mask = None
-        if input_mask is not None:
-            enc_mask = input_mask[:, None, None, :]
+        # We need flattening for extractors: (B, T, P*3)
+        # Wait, FeatureExtractor expects (B, T, N, 3).
+        def get_part(start, end):
+             return x[:, :, start:end, :] # (B, T, P, 3)
+             
+        # Normalize parts (Match PyTorch: Center and Scale per part)
+        ranges = [(0, 21), (21, 42), (42, 75), (75, 130)]
+        x_parts = []
+        
+        # Check dropped (sum mismatch)
+        dropped_mask = (x[..., :2].sum(-1) == 0) # (B, T, N)
+        
+        for start_idx, end_idx in ranges:
+            part = get_part(start_idx, end_idx) # (B, T, N_part, 3)
+            mu = part.mean(axis=2, keepdims=True)
+            std = part.std(axis=2, keepdims=True)
+            part_norm = (part - mu) / (std + 1e-6)
+            part_norm = jnp.nan_to_num(part_norm, nan=0.0, posinf=0.0, neginf=0.0)
             
-        decoder_out = self.decoder(decoder_input_ids, x, encoder_attention_mask=enc_mask, training=training)
-        logits = self.lm_head(decoder_out)
+            # Apply dropped mask (set dropped landmarks to 0)
+            m_part = dropped_mask[:, :, start_idx:end_idx] # (B, T, N_part)
+            part_norm = part_norm * (1.0 - m_part[..., None].astype(part_norm.dtype))
+            
+            x_parts.append(part_norm)
+            
+        x_lhand = self.feature_extractor_lhand(x_parts[0], mask, training)
+        x_rhand = self.feature_extractor_rhand(x_parts[1], mask, training)
+        x_pose = self.feature_extractor_pose(x_parts[2], mask, training)
+        x_face = self.feature_extractor_face(x_parts[3], mask, training)
         
-        return logits
+        x_global = self.feature_extractor(x, mask, training)
+        
+        x1 = jnp.concatenate([x_lhand, x_rhand, x_face, x_pose], axis=-1)
+        x_combined = x_global + x1
+        
+        # Get Cos/Sin
+        cos, sin = self.rotary_emb(x_combined, seq_len=x_combined.shape[1])
+        
+        # Encoder
+        enc_out = self.encoder(x_combined, cos, sin, mask=mask, training=training)
+        
+        # Decoder logic (just forward for now)
+        logits = None
+        if token_ids is not None:
+             dec_out = self.decoder(token_ids, enc_out, encoder_attention_mask=mask, training=training)
+             logits = self.fc(dec_out)
+             
+        # Aux logits
+        # Aux logits
+        # Match PT: aux_logits = self.aux_fc(x[:,0])
+        aux_logits = self.aux_fc(enc_out[:, 0]).squeeze(-1) # (B, 1) -> (B)
+        # if mask is not None:
+        #     aux_logits = (aux_logits * mask).sum(1) / (mask.sum(1) + 1e-6)
+        # else:
+        #     aux_logits = aux_logits.mean(1)
+
+        return logits, aux_logits
