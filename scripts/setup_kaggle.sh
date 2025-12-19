@@ -67,13 +67,14 @@ else
     fi
 fi
 
-# Link train_folded_oof_supp.csv (if exists)
+# Link train_folded_oof_supp.csv (if exists in input, otherwise check local)
 if [ -f "$SUPP_DS/train_folded_oof_supp.csv" ]; then
     echo "Linking train_folded_oof_supp.csv..."
     ln -sf "$SUPP_DS/train_folded_oof_supp.csv" datamount/train_folded_oof_supp.csv
+elif [ -f "datamount/train_folded_oof_supp.csv" ]; then
+    echo "Using existing datamount/train_folded_oof_supp.csv from repo."
 elif [ -f "$SUPP_DS/supplemental_metadata.csv" ]; then
     echo "Found supplemental_metadata.csv. You might need to generate train_folded_oof_supp.csv using scripts."
-    # Potentially link it as base if code supports it, but likely strict naming is needed
 fi
 
 # Link validation weights for OOF generation (if using that script)
