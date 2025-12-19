@@ -7,3 +7,9 @@ rapidfuzz==3.2.0
 timm==0.9.6
 opencv-python-headless==4.8.0.74
 transformers==4.32.1
+# JAX Stack
+jax>=0.4.35
+flax>=0.10.0
+optax>=0.2.3
+tqdm
+pandas>=2.0.0
