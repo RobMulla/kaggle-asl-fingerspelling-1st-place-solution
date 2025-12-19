@@ -324,7 +324,6 @@ class SqueezeformerBlock(nnx.Module):
         c.num_attention_heads = num_attention_heads
         
         self.mhsa_llama = LlamaAttention(c, rngs=rngs)
-        self.mhsa_llama = LlamaAttention(c, rngs=rngs)
         self.ln_mhsa = nnx.LayerNorm(encoder_dim, epsilon=1e-5, rngs=rngs)
         
         self.ff_mhsa = FeedForwardModule(encoder_dim, feed_forward_expansion_factor, feed_forward_dropout_p, rngs=rngs)
