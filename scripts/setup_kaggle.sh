@@ -18,7 +18,7 @@ fi
 
 # 2. Setup Python environment
 echo "Setting up virtual environment..."
-uv venv .venv --python 3.10
+uv venv .venv --python 3.10 --allow-existing
 source .venv/bin/activate
 
 echo "Installing dependencies..."
