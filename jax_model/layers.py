@@ -89,6 +89,24 @@ class SinusoidalPositionalEmbedding(nnx.Module):
         return self.weights.value[position_ids]
 
 # --- RoPE (Llama Rotary Embedding) ---
+# ... (omitted)
+
+class Decoder(nnx.Module):
+# ... (omitted headers)
+    def __call__(self, input_ids, encoder_hidden_states, encoder_attention_mask=None, training=True):
+        # input_ids: (B, T)
+        B, T = input_ids.shape
+        x = self.embed_tokens(input_ids) * math.sqrt(self.config.d_model)
+        
+        # Speech2Text uses offset of pad_token_id + 1
+        pos_offset = self.config.pad_token_id + 1
+        x = x + self.embed_positions(input_ids, past_key_values_length=pos_offset)
+        
+        # S2T Standard: No LayerNorm, just Dropout after embedding
+        x = self.dropout(x, deterministic=not training)
+        
+        # Causal mask
+# --- RoPE (Llama Rotary Embedding) ---
 
 class LlamaRotaryEmbedding(nnx.Module):
     def __init__(self, dim: int, max_position_embeddings: int = 2048, base: int = 10000, rngs: nnx.Rngs = None):
@@ -322,37 +340,37 @@ class SqueezeformerBlock(nnx.Module):
         # 1. MHSA
         residual = x
         x = x * self.scale_mhsa + self.bias_mhsa
-        
         # Prepare mask for attention (B, 1, 1, T) or similar
         attn_mask = None
         if mask is not None:
             # (B, T) -> (B, 1, 1, T). 0 is padding.
-            # LlamaAttention typically expects large negative values for padding zones.
-            # mask is 1 for valid, 0 for pad.
-            # (1.0 - mask) * -1e9
             m = mask[:, None, None, :]
             attn_mask = (1.0 - m) * -1e9
             
         x = residual + self.mhsa_llama(x, cos, sin, mask=attn_mask)
         x = self.ln_mhsa(x)
+        if mask is not None: x = x * mask[..., None]
         
         # 2. FF MHSA
         residual = x
         x = x * self.scale_ff_mhsa + self.bias_ff_mhsa
         x = residual + self.ff_mhsa(x, training=training)
         x = self.ln_ff_mhsa(x)
+        if mask is not None: x = x * mask[..., None]
         
         # 3. Conv
         residual = x
         x = x * self.scale_conv + self.bias_conv
         x = residual + self.conv(x, mask_pad=mask, training=training)
         x = self.ln_conv(x)
+        if mask is not None: x = x * mask[..., None]
         
         # 4. FF Conv
         residual = x
         x = x * self.scale_ff_conv + self.bias_ff_conv
         x = residual + self.ff_conv(x, training=training)
         x = self.ln_ff_conv(x)
+        if mask is not None: x = x * mask[..., None]
         
         return x
 
@@ -403,31 +421,34 @@ class DecoderLayer(nnx.Module):
         self.encoder_attn_layer_norm = nnx.LayerNorm(config.d_model, epsilon=1e-5, rngs=rngs)
         
         self.fc1 = nnx.Linear(config.d_model, config.decoder_ffn_dim, rngs=rngs)
-        self.act = nnx.gelu # Speech2Text standard
+        self.act = nnx.relu # Speech2Text default is ReLU
         self.fc2 = nnx.Linear(config.decoder_ffn_dim, config.d_model, rngs=rngs)
         self.final_layer_norm = nnx.LayerNorm(config.d_model, epsilon=1e-5, rngs=rngs)
         self.dropout = nnx.Dropout(config.attention_dropout, rngs=rngs)
 
     def __call__(self, x, encoder_out, encoder_mask=None, causal_mask=None, training=True):
-        # Self Attn
+        # Self Attn (Pre-Norm)
         residual = x
+        x = self.self_attn_layer_norm(x)
         x = self.self_attn(x, x, x, mask=causal_mask, training=training)
         x = self.dropout(x, deterministic=not training)
-        x = self.self_attn_layer_norm(residual + x)
+        x = residual + x
         
-        # Cross Attn
+        # Cross Attn (Pre-Norm)
         residual = x
+        x = self.encoder_attn_layer_norm(x)
         x = self.encoder_attn(x, encoder_out, encoder_out, mask=encoder_mask, training=training)
         x = self.dropout(x, deterministic=not training)
-        x = self.encoder_attn_layer_norm(residual + x)
+        x = residual + x
         
-        # FF
+        # FF (Pre-Norm)
         residual = x
+        x = self.final_layer_norm(x)
         x = self.act(self.fc1(x))
         x = self.dropout(x, deterministic=not training)
         x = self.fc2(x)
         x = self.dropout(x, deterministic=not training)
-        x = self.final_layer_norm(residual + x)
+        x = residual + x
         
         return x
 
@@ -449,10 +470,15 @@ class Decoder(nnx.Module):
     def __call__(self, input_ids, encoder_hidden_states, encoder_attention_mask=None, training=True):
         # input_ids: (B, T)
         B, T = input_ids.shape
-        x = self.embed_tokens(input_ids)
+        x = self.embed_tokens(input_ids) * math.sqrt(self.config.d_model)
         
-        x = x + self.embed_positions(input_ids)
-        x = x * math.sqrt(self.config.d_model)
+        # Speech2Text uses offset of pad_token_id + 1
+        pos_offset = self.config.pad_token_id + 1
+        pos_emb = self.embed_positions(input_ids, past_key_values_length=pos_offset)
+        
+        # Do NOT mask padding here. PyTorch allows pos_emb for padding tokens.
+        # Attention mask handles it later.
+        x = x + pos_emb
         
         # Causal mask
         idx = jnp.arange(T)

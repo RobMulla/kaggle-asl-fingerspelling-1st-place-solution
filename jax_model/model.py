@@ -130,8 +130,8 @@ class Net(nnx.Module):
         self.feature_extractor = FeatureExtractor(config.n_landmarks, config.encoder_config.encoder_dim, rngs=rngs)
         self.feature_extractor_lhand = FeatureExtractor(21, config.encoder_config.encoder_dim // 4, rngs=rngs)
         self.feature_extractor_rhand = FeatureExtractor(21, config.encoder_config.encoder_dim // 4, rngs=rngs)
-        self.feature_extractor_face = FeatureExtractor(55, config.encoder_config.encoder_dim // 4, rngs=rngs)
-        self.feature_extractor_pose = FeatureExtractor(33, config.encoder_config.encoder_dim // 4, rngs=rngs)
+        self.feature_extractor_face = FeatureExtractor(76, config.encoder_config.encoder_dim // 4, rngs=rngs)
+        self.feature_extractor_pose = FeatureExtractor(12, config.encoder_config.encoder_dim // 4, rngs=rngs)
         
         # Encoder
         self.encoder = SqueezeformerEncoder(config.encoder_config, rngs=rngs)
@@ -182,7 +182,10 @@ class Net(nnx.Module):
              return x[:, :, start:end, :] # (B, T, P, 3)
              
         # Normalize parts (Match PyTorch: Center and Scale per part)
-        ranges = [(0, 21), (21, 42), (42, 75), (75, 130)]
+        # Normalize parts (Match PyTorch: Center and Scale per part)
+        # Checkpoint structure: LHand(21), RHand(21), Pose(12), Face(76)
+        # Ranges: 0-21, 21-42, 42-54, 54-130
+        ranges = [(0, 21), (21, 42), (42, 54), (54, 130)]
         x_parts = []
         
         # Check dropped (sum mismatch)
@@ -192,7 +195,9 @@ class Net(nnx.Module):
             part = get_part(start_idx, end_idx) # (B, T, N_part, 3)
             mu = part.mean(axis=2, keepdims=True)
             std = part.std(axis=2, keepdims=True)
-            part_norm = (part - mu) / (std + 1e-6)
+            # PyTorch does NOT use epsilon here, and handles NaNs/Infs later.
+            # (feat - mean) / std. If std is 0, we get Inf/NaN.
+            part_norm = (part - mu) / std 
             part_norm = jnp.nan_to_num(part_norm, nan=0.0, posinf=0.0, neginf=0.0)
             
             # Apply dropped mask (set dropped landmarks to 0)

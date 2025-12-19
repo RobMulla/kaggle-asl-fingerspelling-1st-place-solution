@@ -32,7 +32,7 @@ class DecoderConfig:
     bos_token_id: int = 61 # Default from cfg_1 SOS
     eos_token_id: int = 62 # Default from cfg_1 EOS
     decoder_start_token_id: int = 61
-    max_length: int = 33 # max_phrase + 1
+    max_length: int = 2048 # Default safe value
 
 @dataclass
 class Config:
