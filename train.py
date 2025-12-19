@@ -208,7 +208,7 @@ for epoch in range(cfg.epochs):
             neptune_run["total_grad_norm"].log(value=total_grad_norm.item(), step=cfg.curr_step)
             neptune_run["total_grad_norm_after_clip"].log(value=total_grad_norm_after_clip.item(), step=cfg.curr_step)
 
-        if i % 100 == 0:
+        if i == 100:
              torch.save({"model": model.state_dict()}, f"{cfg.output_dir}/fold{cfg.fold}/checkpoint_step_{cfg.curr_step}_seed{cfg.seed}.pth")
              print(f"Saved step checkpoint: {cfg.output_dir}/fold{cfg.fold}/checkpoint_step_{cfg.curr_step}_seed{cfg.seed}.pth")
     
