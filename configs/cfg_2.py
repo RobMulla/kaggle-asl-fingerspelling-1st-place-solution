@@ -185,6 +185,6 @@ cfg.train_aug = A.Compose([A.Resample(sample_rate=(0.3,2.), p=0.8),
                            A.SpatialMask(size=(0.05,0.1),mask_value=0.,mode='relative',p=0.5), #mask with 0 as it is post-normalization
                           ])
 
-cfg.train_aug._disable_check_args() #disable otherwise input must be numpy/ int8
+# cfg.train_aug._disable_check_args() #disable otherwise input must be numpy/ int8
 cfg.val_aug = None
 

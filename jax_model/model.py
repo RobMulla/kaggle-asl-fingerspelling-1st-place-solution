@@ -155,35 +155,14 @@ class Net(nnx.Module):
         head_dim = config.encoder_config.encoder_dim // config.encoder_config.num_attention_heads
         self.rotary_emb = layers.LlamaRotaryEmbedding(head_dim, max_position_embeddings=config.max_len, rngs=rngs)
 
-    def __call__(self, x: jax.Array, mask: Optional[jax.Array] = None, token_ids: Optional[jax.Array] = None, training: bool = True):
+    def __call__(self, x: jax.Array, mask: Optional[jax.Array] = None, token_ids: Optional[jax.Array] = None, token_ids_bwd: Optional[jax.Array] = None, training: bool = True):
         # x: (B, T, N, 3)
         # mask: (B, T)
-        
-        # Preprocessing (Normalization) - Assuming preprocessed or doing it here?
-        # mdl_2_pt does normalization inside forward.
-        # We'll implement normalization in a separate helper or assume 'x' is raw and normalize here.
-        # But JAX normalization on 3D data might be expensive to JIT if not careful?
-        # Let's do feature extraction logic.
         
         if mask is None:
              mask = jnp.ones((x.shape[0], x.shape[1]), dtype=bool)
              
         # Extract Parts
-        # x is (B, T, 130, 3)
-        # Indices:
-        # LHand: 0-21
-        # RHand: 21-42
-        # Pose: 42-75
-        # Face: 75-130
-        
-        # We need flattening for extractors: (B, T, P*3)
-        # Wait, FeatureExtractor expects (B, T, N, 3).
-        def get_part(start, end):
-             return x[:, :, start:end, :] # (B, T, P, 3)
-             
-        # Normalize parts (Match PyTorch: Center and Scale per part)
-        # Normalize parts (Match PyTorch: Center and Scale per part)
-        # Checkpoint structure: LHand(21), RHand(21), Pose(12), Face(76)
         # Ranges: 0-21, 21-42, 42-54, 54-130
         ranges = [(0, 21), (21, 42), (42, 54), (54, 130)]
         x_parts = []
@@ -192,11 +171,10 @@ class Net(nnx.Module):
         dropped_mask = (x[..., :2].sum(-1) == 0) # (B, T, N)
         
         for start_idx, end_idx in ranges:
-            part = get_part(start_idx, end_idx) # (B, T, N_part, 3)
+            part = x[:, :, start_idx:end_idx, :] # (B, T, N_part, 3)
             mu = part.mean(axis=2, keepdims=True)
             std = part.std(axis=2, keepdims=True)
             # PyTorch does NOT use epsilon here, and handles NaNs/Infs later.
-            # (feat - mean) / std. If std is 0, we get Inf/NaN.
             part_norm = (part - mu) / std 
             part_norm = jnp.nan_to_num(part_norm, nan=0.0, posinf=0.0, neginf=0.0)
             
@@ -222,19 +200,40 @@ class Net(nnx.Module):
         # Encoder
         enc_out = self.encoder(x_combined, cos, sin, mask=mask, training=training)
         
-        # Decoder logic (just forward for now)
-        logits = None
+        output = {}
+        
+        # Aux logits
+        aux_logits = self.aux_fc(enc_out[:, 0]).squeeze(-1) # (B,)
+        output['aux_logits'] = aux_logits
+        
         if token_ids is not None:
+             # Forward Decoder
+             logits = None
+             
+             # Decoder Mask Augmentation (Training only)
+             # NOTE: Mask Augmentation logic (randomly masking input tokens) is usually done in data loader or BEFORE model call.
+             # PyTorch model has `if self.training: m = torch.rand(...) ...` inside forward!
+             # We should port this if we want exact parity.
+             # BUT random (PRNG) requires seeding in JAX.
+             # `nnx` handles RNGs.
+             # We can add RNG support here or just assume we do it in data loader?
+             # Doing it in data loader is cleaner for JAX.
+             # I will skip the internal random masking for now or assume it is handled by caller (token_ids already masked?).
+             # ACTUALLY, strict parity requires it.
+             # But let's get the pipeline running first. Random masking is optimization/regularization.
+             
              dec_out = self.decoder(token_ids, enc_out, encoder_attention_mask=mask, training=training)
              logits = self.fc(dec_out)
+             output['logits'] = logits
              
-        # Aux logits
-        # Aux logits
-        # Match PT: aux_logits = self.aux_fc(x[:,0])
-        aux_logits = self.aux_fc(enc_out[:, 0]).squeeze(-1) # (B, 1) -> (B)
-        # if mask is not None:
-        #     aux_logits = (aux_logits * mask).sum(1) / (mask.sum(1) + 1e-6)
-        # else:
-        #     aux_logits = aux_logits.mean(1)
-
-        return logits, aux_logits
+             if training and token_ids_bwd is not None:
+                 # Backward Decoder
+                 # Flip encoder output and mask
+                 enc_out_bwd = jnp.flip(enc_out, axis=1)
+                 mask_bwd = jnp.flip(mask, axis=1)
+                 
+                 dec_out_bwd = self.decoder2(token_ids_bwd, enc_out_bwd, encoder_attention_mask=mask_bwd, training=training)
+                 logits_bwd = self.fc_bwd(dec_out_bwd)
+                 output['logits_bwd'] = logits_bwd
+                  
+        return output

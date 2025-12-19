@@ -1,7 +1,7 @@
 import random
 from albumentations.core.transforms_interface import BasicTransform
 from torch.nn import functional as F
-from albumentations import Compose, random_utils
+from albumentations import Compose
 import torch
 import numpy as np
 import math
@@ -600,7 +600,7 @@ class SpatialNoise(BasicTransform):
     
     def get_params_dependent_on_targets(self, params):
         data = params["image"]
-        noise = random_utils.uniform(self.noise_range[0],self.noise_range[1],data.shape)
+        noise = np.random.uniform(self.noise_range[0],self.noise_range[1],data.shape)
 
         return {"noise": noise}
 
@@ -1133,7 +1133,10 @@ class OneOf(BasicTransform):
         self.transforms = transforms
         transforms_ps = [t.p for t in transforms]
         s = sum(transforms_ps)
-        self.transforms_ps = [t / s for t in transforms_ps]
+        if s > 0:
+            self.transforms_ps = [t / s for t in transforms_ps]
+        else:
+            self.transforms_ps = None
 
     def __call__(self, *args, force_apply: bool = False, **data) -> typing.Dict[str, typing.Any]:
 
