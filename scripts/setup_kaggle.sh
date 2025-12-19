@@ -23,7 +23,7 @@ source .venv/bin/activate
 
 echo "Installing dependencies..."
 # Use uv pip install for faster resolution
-uv pip install -r requirements.txt
+uv pip install -p .venv -r requirements.txt
 
 # 3. Setup Data Directory Structure
 echo "Setting up data directories..."
