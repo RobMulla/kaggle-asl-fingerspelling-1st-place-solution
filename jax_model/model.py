@@ -74,7 +74,6 @@ class FeatureExtractor(nnx.Module):
 class SqueezeformerEncoder(nnx.Module):
     def __init__(self, config: config.EncoderConfig, rngs: nnx.Rngs = None):
         self.config = config
-        self.config = config
         # Embedding removed to match PyTorch (Post-Norm, no projection here)
         
         # RoPE
@@ -116,148 +115,9 @@ class SqueezeformerEncoder(nnx.Module):
 
 # --- Decoder ---
 
-class TransformerDecoderLayer(nnx.Module):
-    def __init__(self, config: config.DecoderConfig, rngs: nnx.Rngs = None):
-        self.self_attn = layers.MultiHeadedSelfAttentionModule(config.d_model, config.num_heads, config.attention_dropout, rngs=rngs)
-        # Note: Decoder Self-Attention needs Causal Mask
-        
-        # Cross Attention
-        # We can reuse MultiHeadedSelfAttentionModule if it supports key/value/query separately?
-        # Currently MultiHeadedSelfAttentionModule wraps RelPositionalEncoding + RelativeMultiHeadAttention.
-        # But Decoder in mdl_2_pt (Speech2TextDecoder) uses Standard Attention usually?
-        # Wait, mdl_2_pt uses "Speech2TextDecoder".
-        # Speech2Text uses sinusoidal position + standard attention.
-        # Our layers.py implements RelativeAttention.
-        # We might need StandardAttention for Decoder? 
-        # For now, let's assume we can reuse standard logic or we need to add StandardAttention to layers.
-        # RelativeAttention is usually for Encoder. Decoder usually absolute?
-        # Speech2Text uses absolute.
-        pass
 
-# Wait, implementing full Decoder from scratch is complex.
-# mdl_2_pt uses transformers.Speech2TextDecoder.
-# We should probably port a simplified version or just use a standard Flax Transformer Decoder.
-# Or better: check if we can reuse layers.RelativeMultiHeadAttention if we disable relative part?
-# Actually, let's make a simple DecoderLayer in `model.py` using `nnx.MultiHeadAttention` from Flax (if available) or implement simple one.
-# Flax nnx doesn't have MultiHeadAttention built-in as standard module yet? It has `nnx.MultiHeadAttention`?
-# Let's check imports. `from flax import nnx`
-# We'll implement a simple Standard MHSA for Decoder.
 
-class StandardMultiHeadAttention(nnx.Module):
-    def __init__(self, dim: int, num_heads: int, dropout: float = 0.1, rngs: nnx.Rngs = None):
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        
-        self.q_proj = nnx.Linear(dim, dim, rngs=rngs)
-        self.k_proj = nnx.Linear(dim, dim, rngs=rngs)
-        self.v_proj = nnx.Linear(dim, dim, rngs=rngs)
-        self.o_proj = nnx.Linear(dim, dim, rngs=rngs)
-        self.dropout = nnx.Dropout(dropout, rngs=rngs)
 
-    def __call__(self, q_x, k_x, v_x, mask=None, training=True):
-        # q_x: (B, Tq, D)
-        B, Tq, D = q_x.shape
-        Tk = k_x.shape[1]
-        
-        q = self.q_proj(q_x).reshape(B, Tq, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.k_proj(k_x).reshape(B, Tk, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.v_proj(v_x).reshape(B, Tk, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        
-        attn = jnp.matmul(q, k.transpose(0, 1, 3, 2)) * self.scale
-        
-        if mask is not None:
-            # mask: (B, 1, Tq, Tk)
-            attn = attn + mask
-            
-        attn = nnx.softmax(attn, axis=-1)
-        attn = self.dropout(attn, deterministic=not training)
-        
-        out = jnp.matmul(attn, v).transpose(0, 2, 1, 3).reshape(B, Tq, D)
-        return self.o_proj(out)
-
-class DecoderLayer(nnx.Module):
-    def __init__(self, config: config.DecoderConfig, rngs: nnx.Rngs = None):
-        self.self_attn = StandardMultiHeadAttention(config.d_model, config.num_heads, config.attention_dropout, rngs=rngs)
-        self.self_attn_layer_norm = nnx.LayerNorm(config.d_model, epsilon=1e-5, rngs=rngs)
-        
-        self.encoder_attn = StandardMultiHeadAttention(config.d_model, config.num_heads, config.attention_dropout, rngs=rngs)
-        self.encoder_attn_layer_norm = nnx.LayerNorm(config.d_model, epsilon=1e-5, rngs=rngs)
-        
-        self.fc1 = nnx.Linear(config.d_model, config.decoder_ffn_dim, rngs=rngs)
-        self.act = layers.Swish() # Or GELU? Speech2Text uses GELU usually.
-        self.fc2 = nnx.Linear(config.decoder_ffn_dim, config.d_model, rngs=rngs)
-        self.final_layer_norm = nnx.LayerNorm(config.d_model, epsilon=1e-5, rngs=rngs)
-        self.dropout = nnx.Dropout(config.attention_dropout, rngs=rngs) # Reuse p
-
-    def __call__(self, x, encoder_out, encoder_mask=None, causal_mask=None, training=True):
-        # Self Attn
-        residual = x
-        x = self.self_attn(x, x, x, mask=causal_mask, training=training)
-        x = self.dropout(x, deterministic=not training)
-        x = self.self_attn_layer_norm(residual + x)
-        
-        # Cross Attn
-        residual = x
-        x = self.encoder_attn(x, encoder_out, encoder_out, mask=encoder_mask, training=training)
-        x = self.dropout(x, deterministic=not training)
-        x = self.encoder_attn_layer_norm(residual + x)
-        
-        # FF
-        residual = x
-        x = self.act(self.fc1(x))
-        x = self.dropout(x, deterministic=not training)
-        x = self.fc2(x)
-        x = self.dropout(x, deterministic=not training)
-        x = self.final_layer_norm(residual + x)
-        
-        return x
-
-class Decoder(nnx.Module):
-    layers: nnx.List
-
-    def __init__(self, config: config.DecoderConfig, rngs: nnx.Rngs = None):
-        self.config = config
-        cfg = config
-        self.embed_tokens = nnx.Embed(cfg.vocab_size, cfg.d_model, rngs=rngs)
-        self.embed_positions = layers.SinusoidalPositionalEmbedding(cfg.max_length + 2, cfg.d_model, rngs=rngs)
-        
-        self.layers = nnx.List([
-            DecoderLayer(cfg, rngs=rngs)
-            for _ in range(cfg.decoder_layers)
-        ])
-        self.layer_norm = nnx.LayerNorm(cfg.d_model, epsilon=1e-5, rngs=rngs)
-        
-    def __call__(self, input_ids, encoder_hidden_states, encoder_attention_mask=None, training=True):
-        # input_ids: (B, T)
-        B, T = input_ids.shape
-        x = self.embed_tokens(input_ids)
-        
-        x = x + self.embed_positions(input_ids)
-        # Scale input? Speech2Text scales by sqrt(d_model)
-        x = x * math.sqrt(self.config.d_model)
-        
-        # Causal mask
-        # (B, 1, T, T) with -inf upper triangular
-        idx = jnp.arange(T)
-        causal_mask = (idx[None, :] <= idx[:, None])
-        causal_mask = jnp.broadcast_to(causal_mask, (B, 1, T, T))
-        causal_mask = jnp.where(causal_mask, 0, -1e9)
-        
-        # Encoder mask
-        # encoder_attention_mask: (B, S). 1=valid, 0=pad
-        if encoder_attention_mask is not None:
-             # (B, 1, 1, S)
-             em = encoder_attention_mask[:, None, None, :]
-             em = (1.0 - em) * -1e9
-        else:
-            em = None
-            
-        for layer in self.layers:
-            x = layer(x, encoder_hidden_states, encoder_mask=em, causal_mask=causal_mask, training=training)
-            
-        x = self.layer_norm(x)
-        return x
 
 # --- Net ---
 
@@ -277,8 +137,8 @@ class Net(nnx.Module):
         self.encoder = SqueezeformerEncoder(config.encoder_config, rngs=rngs)
         
         # Decoders
-        self.decoder = Decoder(config.decoder_config, rngs=rngs)
-        self.decoder2 = Decoder(config.decoder_config, rngs=rngs) # Backward
+        self.decoder = layers.Decoder(config.decoder_config, rngs=rngs)
+        self.decoder2 = layers.Decoder(config.decoder_config, rngs=rngs) # Backward
         
         # Heads
         self.fc = nnx.Linear(config.decoder_config.d_model, config.decoder_config.vocab_size, use_bias=False, rngs=rngs)

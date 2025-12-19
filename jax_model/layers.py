@@ -4,12 +4,13 @@ import jax.numpy as jnp
 from flax import nnx
 import math
 from typing import Optional, Tuple, Callable
+from . import config
 
 # --- Basic Activations ---
 
-class Swish(nnx.Module):
-    def __call__(self, x: jax.Array) -> jax.Array:
-        return nnx.swish(x)
+# --- Basic Activations ---
+
+# Swish class removed, use nnx.swish/nnx.silu directly
 
 class GLU(nnx.Module):
     def __init__(self, dim: int = -1):
@@ -203,7 +204,7 @@ class LlamaAttention(nnx.Module):
 class FeedForwardModule(nnx.Module):
     def __init__(self, encoder_dim: int = 512, expansion_factor: int = 4, dropout_p: float = 0.1, rngs: nnx.Rngs = None):
         self.ffn1 = nnx.Linear(encoder_dim, encoder_dim * expansion_factor, rngs=rngs)
-        self.act = Swish()
+        self.act = nnx.swish
         self.do1 = nnx.Dropout(dropout_p, rngs=rngs)
         self.ffn2 = nnx.Linear(encoder_dim * expansion_factor, encoder_dim, rngs=rngs)
         self.do2 = nnx.Dropout(dropout_p, rngs=rngs)
@@ -265,7 +266,7 @@ class ConvModule(nnx.Module):
         # We need to expose this param or set it here.
         # Let's set it to 0.985 if that's what mdl_2_pt uses.
         
-        self.act2 = Swish()
+        self.act2 = nnx.swish
         self.pw_conv_2 = PointwiseConv1d(in_channels, in_channels, stride=1, padding=0, bias=True, rngs=rngs)
         self.do = nnx.Dropout(dropout_p, rngs=rngs)
 
@@ -328,9 +329,9 @@ class SqueezeformerBlock(nnx.Module):
             # (B, T) -> (B, 1, 1, T). 0 is padding.
             # LlamaAttention typically expects large negative values for padding zones.
             # mask is 1 for valid, 0 for pad.
-            # (1.0 - mask) * -65504
+            # (1.0 - mask) * -1e9
             m = mask[:, None, None, :]
-            attn_mask = (1.0 - m) * -65504.0
+            attn_mask = (1.0 - m) * -1e9
             
         x = residual + self.mhsa_llama(x, cos, sin, mask=attn_mask)
         x = self.ln_mhsa(x)
@@ -353,4 +354,121 @@ class SqueezeformerBlock(nnx.Module):
         x = residual + self.ff_conv(x, training=training)
         x = self.ln_ff_conv(x)
         
+        return x
+
+# --- Decoder Components ---
+
+class StandardMultiHeadAttention(nnx.Module):
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.1, rngs: nnx.Rngs = None):
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        self.q_proj = nnx.Linear(dim, dim, rngs=rngs)
+        self.k_proj = nnx.Linear(dim, dim, rngs=rngs)
+        self.v_proj = nnx.Linear(dim, dim, rngs=rngs)
+        self.o_proj = nnx.Linear(dim, dim, rngs=rngs)
+        self.dropout = nnx.Dropout(dropout, rngs=rngs)
+
+    def __call__(self, q_x, k_x, v_x, mask=None, training=True):
+        # q_x: (B, Tq, D)
+        B, Tq, D = q_x.shape
+        Tk = k_x.shape[1]
+        
+        # (B, T, H, K) -> (B, H, T, K)
+        q = self.q_proj(q_x).reshape(B, Tq, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.k_proj(k_x).reshape(B, Tk, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.v_proj(v_x).reshape(B, Tk, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        
+        # (B, H, Tq, K) @ (B, H, K, Tk) -> (B, H, Tq, Tk)
+        attn = jnp.matmul(q, k.transpose(0, 1, 3, 2)) * self.scale
+        
+        if mask is not None:
+            # mask: (B, 1, Tq, Tk)
+            attn = attn + mask
+            
+        attn = nnx.softmax(attn, axis=-1)
+        attn = self.dropout(attn, deterministic=not training)
+        
+        # (B, H, Tq, Tk) @ (B, H, Tk, K) -> (B, H, Tq, K)
+        out = jnp.matmul(attn, v).transpose(0, 2, 1, 3).reshape(B, Tq, D)
+        return self.o_proj(out)
+
+class DecoderLayer(nnx.Module):
+    def __init__(self, config: config.DecoderConfig, rngs: nnx.Rngs = None):
+        self.self_attn = StandardMultiHeadAttention(config.d_model, config.num_heads, config.attention_dropout, rngs=rngs)
+        self.self_attn_layer_norm = nnx.LayerNorm(config.d_model, epsilon=1e-5, rngs=rngs)
+        
+        self.encoder_attn = StandardMultiHeadAttention(config.d_model, config.num_heads, config.attention_dropout, rngs=rngs)
+        self.encoder_attn_layer_norm = nnx.LayerNorm(config.d_model, epsilon=1e-5, rngs=rngs)
+        
+        self.fc1 = nnx.Linear(config.d_model, config.decoder_ffn_dim, rngs=rngs)
+        self.act = nnx.gelu # Speech2Text standard
+        self.fc2 = nnx.Linear(config.decoder_ffn_dim, config.d_model, rngs=rngs)
+        self.final_layer_norm = nnx.LayerNorm(config.d_model, epsilon=1e-5, rngs=rngs)
+        self.dropout = nnx.Dropout(config.attention_dropout, rngs=rngs)
+
+    def __call__(self, x, encoder_out, encoder_mask=None, causal_mask=None, training=True):
+        # Self Attn
+        residual = x
+        x = self.self_attn(x, x, x, mask=causal_mask, training=training)
+        x = self.dropout(x, deterministic=not training)
+        x = self.self_attn_layer_norm(residual + x)
+        
+        # Cross Attn
+        residual = x
+        x = self.encoder_attn(x, encoder_out, encoder_out, mask=encoder_mask, training=training)
+        x = self.dropout(x, deterministic=not training)
+        x = self.encoder_attn_layer_norm(residual + x)
+        
+        # FF
+        residual = x
+        x = self.act(self.fc1(x))
+        x = self.dropout(x, deterministic=not training)
+        x = self.fc2(x)
+        x = self.dropout(x, deterministic=not training)
+        x = self.final_layer_norm(residual + x)
+        
+        return x
+
+class Decoder(nnx.Module):
+    layers: nnx.List
+
+    def __init__(self, config: config.DecoderConfig, rngs: nnx.Rngs = None):
+        self.config = config
+        cfg = config
+        self.embed_tokens = nnx.Embed(cfg.vocab_size, cfg.d_model, rngs=rngs)
+        self.embed_positions = SinusoidalPositionalEmbedding(cfg.max_length + 2, cfg.d_model, rngs=rngs)
+        
+        self.layers = nnx.List([
+            DecoderLayer(cfg, rngs=rngs)
+            for _ in range(cfg.decoder_layers)
+        ])
+        self.layer_norm = nnx.LayerNorm(cfg.d_model, epsilon=1e-5, rngs=rngs)
+        
+    def __call__(self, input_ids, encoder_hidden_states, encoder_attention_mask=None, training=True):
+        # input_ids: (B, T)
+        B, T = input_ids.shape
+        x = self.embed_tokens(input_ids)
+        
+        x = x + self.embed_positions(input_ids)
+        x = x * math.sqrt(self.config.d_model)
+        
+        # Causal mask
+        idx = jnp.arange(T)
+        causal_mask = (idx[None, :] <= idx[:, None])
+        causal_mask = jnp.broadcast_to(causal_mask, (B, 1, T, T))
+        causal_mask = jnp.where(causal_mask, 0, -1e9)
+        
+        # Encoder mask
+        em = None
+        if encoder_attention_mask is not None:
+             # (B, 1, 1, S)
+             em = encoder_attention_mask[:, None, None, :]
+             em = (1.0 - em) * -1e9
+            
+        for layer in self.layers:
+            x = layer(x, encoder_hidden_states, encoder_mask=em, causal_mask=causal_mask, training=training)
+            
+        x = self.layer_norm(x)
         return x
