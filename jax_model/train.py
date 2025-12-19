@@ -131,7 +131,7 @@ def train_step(model, optimizer, opt_state, batch, loss_config):
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
     (loss, (l_ce, l_bwd, l_aux)), grads = grad_fn(model)
     
-    updates, opt_state = optimizer.update(grads, opt_state, model)
+    updates, opt_state = optimizer.update(grads, opt_state, params=nnx.state(model, nnx.Param))
     nnx.update(model, updates)
     
     return loss, l_ce, l_bwd, l_aux, opt_state
