@@ -112,7 +112,7 @@ class CustomDataset(Dataset):
         landmarks = np.array([item[2:] for item in self.xyz_landmarks[:len(self.xyz_landmarks)//3]])
         
         symmetry = pd.read_csv(cfg.symmetry_fp).set_index('id')
-        flipped_landmarks = symmetry.loc[landmarks]['corresponding_id'].values
+        flipped_landmarks = np.array(symmetry.loc[landmarks]['corresponding_id'].values)
         self.flip_array = np.where(landmarks[:,None]==flipped_landmarks[None,:])[1]
         
         self.max_len = cfg.max_len
