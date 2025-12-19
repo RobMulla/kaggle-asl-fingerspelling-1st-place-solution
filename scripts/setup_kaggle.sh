@@ -57,6 +57,15 @@ else
     echo "WARNING: character_to_prediction_index.json not found."
 fi
 
+# Link supplemental_landmarks
+if [ -d "$SUPP_DS/supplemental_landmarks" ]; then
+    echo "Linking supplemental_landmarks..."
+    rm -rf datamount/supplemental_landmarks
+    ln -sf "$SUPP_DS/supplemental_landmarks" datamount/supplemental_landmarks
+else
+    echo "WARNING: supplemental_landmarks not found."
+fi
+
 # Link symmetry.csv (if exists)
 if [ -f "$SUPP_DS/symmetry.csv" ]; then
     echo "Linking symmetry.csv..."

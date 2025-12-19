@@ -242,6 +242,14 @@ class CustomDataset(Dataset):
 
 
     def load_one(self, file_id, sequence_id):
+        # Try primary folder
         path = self.data_folder + f'{file_id}/{sequence_id}.npy'
+        if not os.path.exists(path):
+            # Try supplemental folder
+            # Assuming it is linked at datamount/supplemental_landmarks
+            supp_path = 'datamount/supplemental_landmarks/' + f'{file_id}/{sequence_id}.npy'
+            if os.path.exists(supp_path):
+                path = supp_path
+        
         data = np.load(path) # seq_len, 3* nlandmarks
         return data
