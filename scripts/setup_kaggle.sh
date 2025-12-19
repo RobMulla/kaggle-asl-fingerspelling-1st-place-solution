@@ -38,10 +38,12 @@ TRAIN_DS="$KAGGLE_INPUT/asl-fingerspelling-preprocessing-train-dataset"
 # Link train_landmarks_npy
 if [ -d "$TRAIN_DS/train_landmarks_npy" ]; then
     echo "Linking train_landmarks_npy..."
+    rm -rf datamount/train_landmarks_npy
     ln -sf "$TRAIN_DS/train_landmarks_npy" datamount/train_landmarks_npy
 elif [ -d "$TRAIN_DS" ]; then
     # Fallback if train_landmarks_npy is directly inside the mount
     echo "Linking train_landmarks_npy (fallback)..."
+    rm -rf datamount/train_landmarks_npy
     ln -sf "$TRAIN_DS" datamount/train_landmarks_npy
 else
     echo "WARNING: train_landmarks_npy not found in expected locations."
