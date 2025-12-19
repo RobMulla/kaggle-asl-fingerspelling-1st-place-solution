@@ -175,12 +175,12 @@ def make_bwd_labels(token_ids, lengths, pad_id=59):
         
     return bwd_ids
 
-def main():
+def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--debug", action='store_true')
-    args = parser.parse_args()
+    args = parser.parse_args(args)
     
     # Config
     cfg = cfg_ch_38.cfg
